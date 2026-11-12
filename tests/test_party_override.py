@@ -24,7 +24,7 @@ process.stdout.write(JSON.stringify(value));
 '''
         result = subprocess.run([NODE, '-e', source, str(SCRIPT), json.dumps(config),
                                  json.dumps(parents if parents is not None else ['Parent Selector'])],
-                                capture_output=True, text=True, timeout=5, check=True)
+                                capture_output=True, text=True, encoding='utf-8', timeout=5, check=True)
         return json.loads(result.stdout)
 
     def base(self):
