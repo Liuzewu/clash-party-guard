@@ -1,0 +1,6 @@
+{
+  "proxies": [
+    {"name": "Node A", "type": "vless", "server": "node-a.example.invalid", "port": 443, "uuid": "00000000-0000-0000-0000-000000000001", "tls": true},
+    {"name": "Node B", "type": "vless", "server": "node-b.example.invalid", "port": 443, "uuid": "00000000-0000-0000-0000-000000000002", "tls": true}
+  ]
+}

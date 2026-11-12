@@ -1,0 +1,20 @@
+{
+  "controller": "http://127.0.0.1:9090",
+  "secret_env": "CLASH_CONTROLLER_SECRET",
+  "group": "Example Selector",
+  "targets": [
+    {"url": "https://example.com/", "expected": "200"},
+    {"url": "https://example.org/", "expected": "200"}
+  ],
+  "health_url": "https://www.gstatic.com/generate_204",
+  "excluded_name_patterns": ["测试|測試"],
+  "coordination": {
+    "member": "device-b",
+    "group_id": "service-one",
+    "required_members": ["device-a", "device-b"],
+    "fixed_home": true,
+    "command": ["ssh", "-o", "BatchMode=yes", "user@example-host", "env", "PYTHONPATH=/path/to/clash-party-guard", "python3", "-m", "clash_guard.coordination", "--state", "/path/to/clash-party-guard/examples/coordination-broker.state.json"],
+    "node_config_path": "examples/coordination-nodes.example.json",
+    "failure_wait": 20
+  }
+}

@@ -26,7 +26,9 @@ The final `would_switch` event indicates a proposed switch; the demo does not ch
 - Preview proposed changes without changing the selection.
 - Record check results and compare success rates and latency after a holding period; upgrade when a candidate stays better and passes verification.
 - Return to the original primary node after sustained recovery and verification.
-- Use optional, locally supplied node quality data when comparing candidates, without querying a third-party scoring service.
+- Compare optional locally supplied quality data or enable background IP quality checks. Third-party scoring is off by default.
+- Optionally coordinate node changes across devices at home.
+- Optionally follow a parent selector chosen manually, with a fresh grace period after leaving it.
 
 ## Connect to Clash Party
 
@@ -50,11 +52,23 @@ The final `would_switch` event indicates a proposed switch; the demo does not ch
    python3 -m clash_guard --config config.json --enable-switch
    ```
 
-The guard checks continuously while it is running. Press `Ctrl+C` to stop it. Check history is stored under `~/.local/state/clash-party-guard/` by default. The holding period, sampling thresholds and recovery time are configurable.
+The guard checks continuously while it is running. Press `Ctrl+C` to stop it. By default, state is stored under `~/.local/state/clash-party-guard/` and separated by selector. Preview and switching use separate directories, so history and automatic scores accumulated in preview do not carry over. Use `--state-dir` to set a directory; only one guard can use it at a time. If you set it explicitly, use different directories for preview and switching. The holding period, sampling thresholds and recovery time are configurable.
 
-To use external quality data, set `quality_file` in your configuration to a local JSON file. See the [quality data example](examples/quality.example.json): `score` ranges from 0 to 100, and `observed_at` is the actual measurement time. Replace the example timestamp. Data is valid for 24 hours by default. Candidates with the same success rate are compared by score only if each has a valid score; a healthy upgrade requires a score at least as high as the current node only when both scores are valid. You supply the scores; the project does not fetch or verify them.
+To use locally supplied quality data, set `quality_file` in your configuration to a local JSON file. See the [quality data example](examples/quality.example.json): `score` ranges from 0 to 100, and `observed_at` is the actual measurement time. Replace the example timestamp. Data is valid for 24 hours by default. Candidates with the same success rate are compared by score only if each has a valid score; a healthy upgrade requires a score at least as high as the current node only when both scores are valid.
+
+You can also configure [automatic IP quality checks](docs/ip-quality.en.md) to sample locally and query third-party scores, or [multi-device coordination](docs/coordination.en.md) to coordinate changes with devices at home. Both features require separate configuration and are disabled by default. If both `quality_file` and automatic checks are configured, enabling automatic checks uses only automatic scores; it does not fall back to the manual file.
 
 The [Party override example](examples/party-override.js) adds nodes listed in `proxies` to a named group. Change the group name and filter before use; configurations using providers need further adaptation.
+
+## Follow a parent selector manually
+
+To choose another selector in Clash Party, first make it an option in the guarded selector. Then list the permitted parent names at the top level of the guard configuration:
+
+```json
+"follow_parent_groups": ["Parent Selector"]
+```
+
+Each parent must be a `Selector`. You can also edit `followParentGroups` in the [Party override example](examples/party-override.js) to add valid parents as options; it does not select one automatically. Once a parent is chosen manually, the guard pauses probes and automatic selection for this group, cancels any running quality sample and pauses sampling. A missing or cyclic parent path produces `follow_parent_unavailable`. After leaving the parent, sampling can resume, and the guard resets its primary node and starts the `startup_grace` observation period. See [coordination](docs/coordination.en.md) for multi-device behavior.
 
 ## Run the tests
 
@@ -66,6 +80,8 @@ The tests use a simulated controller and do not connect to your existing Clash c
 
 ## Current scope
 
-This version runs on one device; multi-device coordination and automatic IP scoring are not included. Check history and local quality data are associated by node name, so changing a node's connection parameters does not automatically reset old records. Tests run in isolation; the quality of a real connection depends on the network and selected nodes.
+When automatic scoring or coordination uses a dynamic node source (`node_config_path` or `identity_command`), the guard checks local history against node parameters. If a node changes or disappears, its old records are archived and its former-primary eligibility is cleared. When identity is temporarily unknown, healthy upgrades and returns to the former primary are paused; fault recovery remains available after two checks. If multiple dynamic sources are configured, their node configurations must agree.
+
+Without a dynamic node source, check history is associated by name and cannot detect changed parameters under the same name. Static `node_ids` and `identity_file` cannot detect such changes automatically either. Manually supplied quality data is also associated by name. Multi-device coordination and automatic scoring have been tested in isolation, but have not yet passed end-to-end tests across real devices and external scoring services. Real application performance depends on the network and selected nodes.
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) to report a problem or contribute. Released under the [MIT License](LICENSE).

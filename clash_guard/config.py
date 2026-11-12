@@ -28,6 +28,10 @@ def load(path):
         hosts.add(p.hostname)
     if len(hosts) != 2:
         raise ValueError('targets must use different hosts')
+    parents = data.setdefault('follow_parent_groups', [])
+    if (not isinstance(parents, list) or any(not isinstance(value, str) or not value.strip() for value in parents)
+            or len(set(parents)) != len(parents) or data['group'] in parents):
+        raise ValueError('follow_parent_groups must contain distinct parent names other than the current group')
     for field, default in [('normal_interval', 15), ('failure_interval', 5), ('minimum_failure_duration', 30), ('startup_grace', 60), ('sampling_interval', 120), ('hold_days', 30), ('min_sample_count', 100), ('min_sample_span_hours', 72), ('review_wins', 3), ('review_span_hours', 48), ('recovery_seconds', 1800), ('quality_max_age', 86400)]:
         v = data.setdefault(field, default)
         if isinstance(v, bool) or not isinstance(v, (int, float)) or not math.isfinite(v) or v < 0:
@@ -42,6 +46,12 @@ def load(path):
     quality_file = data.get('quality_file')
     if quality_file is not None and (not isinstance(quality_file, str) or not quality_file):
         raise ValueError('quality_file must be a path')
+    if 'coordination' in data:
+        from .coordination import validate_coordination_config
+        validate_coordination_config(data['coordination'])
+    if 'ip_quality' in data:
+        from .ip_quality import validate_settings
+        validate_settings(data['ip_quality'])
     data.setdefault('controller', 'http://127.0.0.1:9090')
     data.setdefault('secret_env', 'CLASH_CONTROLLER_SECRET')
     return data

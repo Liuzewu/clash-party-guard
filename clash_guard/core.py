@@ -89,15 +89,77 @@ def rank(names, history, now, quality=None, quality_max_age=86400):
 
 
 class Guard:
-    def __init__(self, controller, config, state=None, *, switch=False, sleep=None, clock=None):
+    def __init__(self, controller, config, state=None, *, switch=False, sleep=None, clock=None, coordination=None):
         self.api, self.config, self.switch = controller, config, switch
         self.state = state if isinstance(state, dict) else {}
         self.sleep = sleep or (lambda _: None)
         self.clock = clock
+        self.coordination = coordination
+        self.quality_provider = None
+        self.node_identity_provider = None
+        self.identity_available = True
+        self.identity_changed = False
         self.quality = {}
         self.state.setdefault('samples', {})
         self.state.setdefault('wins', {})
         self.state.setdefault('failures', 0)
+
+    def _sync_identity(self, now):
+        if self.node_identity_provider is None:
+            self.identity_available = True
+            self.identity_changed = False
+            return set()
+        try:
+            current = self.node_identity_provider()
+            if not isinstance(current, dict) or any(not isinstance(k, str) or not isinstance(v, str) or not v for k, v in current.items()):
+                raise ValueError('node identity unavailable')
+        except Exception:
+            self.identity_available = False
+            self.identity_changed = False
+            self.quality = {}
+            return set()
+        self.identity_available = True
+        previous = self.state.get('node_identity')
+        if not isinstance(previous, dict):
+            previous = {}
+        affected = {name for name in set(previous) | set(current) if previous.get(name) != current.get(name)}
+        # History created before an identity source was enabled is unbound.
+        affected.update(name for name in self.state['samples'] if name not in previous)
+        affected.update(name for name in self.state['wins'] if name not in previous)
+        if self.state.get('primary') and self.state['primary'] not in previous:
+            affected.add(self.state['primary'])
+        self.identity_changed = bool(affected)
+        if affected:
+            self.quality = {}
+            archive = self.state.setdefault('retired_node_history', [])
+            since = self.state.setdefault('node_identity_since', {})
+            for name in sorted(affected):
+                samples = self.state['samples'].pop(name, [])
+                wins = self.state['wins'].get(name, [])
+                if samples or wins or name == self.state.get('primary'):
+                    archive.append({'name': name, 'identity': previous.get(name), 'samples': samples,
+                                    'wins': wins, 'retired_at': now})
+                if name in current:
+                    since[name] = now
+                else:
+                    since.pop(name, None)
+            del archive[:-64]
+            self.state['wins'] = {}
+            self.state['recovery_since'] = None
+            if self.state.get('selected') in affected:
+                self.state.pop('selected', None)
+            if self.state.get('primary') in affected:
+                self.state['primary'] = self.state.get('selected')
+            coordinator = self.coordination
+            if coordinator is not None and coordinator.pending:
+                if coordinator._home() is True:
+                    coordinator._abort(self, coordinator.pending.get('id'))
+                coordinator.pending = None
+        self.state['node_identity'] = dict(current)
+        return affected
+
+    def _known_identity(self, name):
+        return self.node_identity_provider is None or (self.identity_available and name in self.state.get('node_identity', {}))
 
     def _now(self, fallback):
         return self.clock() if self.clock is not None else fallback
@@ -112,6 +174,8 @@ class Guard:
         delays = [self.api.probe(name, target) for target in self.config['targets']]
         ok = all(isinstance(d, (int, float)) and not isinstance(d, bool) and d > 0 for d in delays)
         value = sum(delays) / len(delays) if ok else None
+        if not self._known_identity(name):
+            return ok
         samples = self.state['samples'].setdefault(name, [])
         bucket = int(now // 1800) * 1800
         if samples and len(samples[-1]) == 4 and samples[-1][0] == bucket:
@@ -127,6 +191,67 @@ class Guard:
     def _allowed(self, name, proxies, now):
         return eligible(name, proxies, now, self.config.get('health_url', 'https://www.gstatic.com/generate_204'), self.config['excluded_name_patterns'], self.config.get('health_max_age', 300))
 
+    def _candidate_better(self, current, candidate, now):
+        """Apply the same sample, stability, latency and IP-quality gates everywhere."""
+        if not self._known_identity(current) or not self._known_identity(candidate):
+            return False
+        old = metrics(self.state['samples'].get(current, []), now)
+        new = metrics(self.state['samples'].get(candidate, []), now)
+        ready = all(m['count'] >= self.config['min_sample_count'] and
+                    m['span'] >= self.config['min_sample_span_hours'] * 3600 and
+                    m['mean_ms'] is not None for m in (old, new))
+        old_quality = quality_score(current, self.quality, now, self.config.get('quality_max_age', 86400))
+        new_quality = quality_score(candidate, self.quality, now, self.config.get('quality_max_age', 86400))
+        quality_ok = old_quality is None or new_quality is None or new_quality >= old_quality
+        return bool(ready and quality_ok and new['success_rate'] >= old['success_rate'] and
+                    new['mean_ms'] <= old['mean_ms'] * 0.8)
+
+    def _upgrade_ready(self, current, candidate, now):
+        wins = self.state['wins'].get(candidate, [])
+        return bool(self.state.get('selected') == current and
+                    now - self.state.get('selected_since', now) >= self.config['hold_days'] * 86400 and
+                    self._candidate_better(current, candidate, now) and
+                    len(wins) >= self.config['review_wins'] and wins and
+                    wins[-1] - wins[0] >= self.config['review_span_hours'] * 3600)
+
+    def _refresh_quality(self):
+        if self.node_identity_provider is not None and not self.identity_available:
+            self.quality = {}
+            return
+        if self.quality_provider is not None:
+            try:
+                current = self.quality_provider()
+                self.quality = current if isinstance(current, dict) else {}
+            except Exception:
+                # A failed or revoked evidence source is unknown, never stale.
+                self.quality = {}
+        if self.node_identity_provider is not None:
+            filtered = {}
+            for name, row in self.quality.items():
+                if not self._known_identity(name) or not isinstance(row, dict):
+                    continue
+                observed = row.get('observed_at')
+                try:
+                    observed = _stamp(observed) if isinstance(observed, str) else observed
+                    if isinstance(observed, (int, float)) and not isinstance(observed, bool) and observed >= self.state.get('node_identity_since', {}).get(name, 0):
+                        filtered[name] = row
+                except (ValueError, TypeError, OverflowError):
+                    continue
+            self.quality = filtered
+
+    def _quality_snapshot(self, current, candidate, now):
+        age = self.config.get('quality_max_age', 86400)
+        return (quality_score(current, self.quality, now, age),
+                quality_score(candidate, self.quality, now, age))
+
+    @staticmethod
+    def _quality_not_worse(previous, current):
+        if previous is None: return True
+        old_before, new_before = previous
+        old_now, new_now = current
+        return not ((old_before is not None and (old_now is None or old_now > old_before)) or
+                    (new_before is not None and (new_now is None or new_now < new_before)))
+
     def _verified(self, candidate, current, now):
         for attempt in range(2):
             proxies = self.api.proxies(); group = self._group(proxies)
@@ -138,11 +263,22 @@ class Guard:
                 self.sleep(3)
         return True
 
-    def _switch(self, current, candidate, now, event):
+    def _switch_local(self, current, candidate, now, event, quality_baseline=None):
+        affected = self._sync_identity(self._now(now))
+        if current in affected or candidate in affected:
+            return 'identity_changed'
+        if event != 'switch' and (not self._known_identity(current) or not self._known_identity(candidate)):
+            return 'identity_unknown'
         proxies = self.api.proxies()
         group = self._group(proxies)
         if group['now'] != current or candidate not in group['all'] or not self._allowed(candidate, proxies, self._now(now)):
             return 'selection_changed'
+        if event == 'upgrade':
+            self._refresh_quality()
+            if (not self._quality_not_worse(quality_baseline, self._quality_snapshot(current, candidate, self._now(now))) or
+                    not self._upgrade_ready(current, candidate, self._now(now))):
+                self.state['wins'].pop(candidate, None)
+                return 'upgrade_cancelled'
         if not self.switch:
             return 'would_' + event
         self.api.select(self.config['group'], candidate)
@@ -154,8 +290,57 @@ class Guard:
             self.state['primary'] = candidate
         return event
 
+    def _switch(self, current, candidate, now, event, quality_baseline=None):
+        if self.switch and self.coordination is not None:
+            outcome = self.coordination.propose(self, current, candidate, now, event, quality_baseline=quality_baseline)
+            if outcome is not None:
+                return outcome
+        return self._switch_local(current, candidate, now, event, quality_baseline=quality_baseline)
+
     def step(self, now):
         try:
+            self._sync_identity(now)
+            if self.node_identity_provider is not None:
+                self._refresh_quality()
+            # A deliberate parent selection takes precedence over a pending plan.
+            # Check it before coordination can probe or change this selector.
+            if self.config.get('follow_parent_groups') or self.state.get('following_parent'):
+                proxies = self.api.proxies()
+                group = self._group(proxies)
+                current = group['now']
+                if current in self.config.get('follow_parent_groups', []) and current in group['all']:
+                    parent = proxies.get(current, {})
+                    valid = parent.get('type') == 'Selector'
+                    seen = {self.config['group']}
+                    name = current
+                    while valid:
+                        if name in seen or name not in proxies:
+                            valid = False
+                            break
+                        seen.add(name)
+                        item = proxies[name]
+                        if 'all' not in item:
+                            kind = re.sub(r'[-_ ]', '', str(item.get('type', ''))).lower()
+                            valid = bool(kind and kind not in VIRTUAL)
+                            break
+                        members, selected = item.get('all'), item.get('now')
+                        if not isinstance(members, list) or not isinstance(selected, str) or selected not in members:
+                            valid = False
+                            break
+                        name = selected
+                    self.state.update(following_parent=current, failures=0, failure_since=None,
+                                      recovery_since=None, wins={}, last_step=now)
+                    if self.switch and self.coordination is not None:
+                        self.coordination.follow(self)
+                    return {'event': 'following_parent' if valid else 'follow_parent_unavailable',
+                            'selected': current, 'wait': self.config['normal_interval']}
+                if self.state.pop('following_parent', None) is not None:
+                    # Even returning to the same leaf starts a fresh manual grace.
+                    self.state.pop('selected', None)
+            if self.switch and self.coordination is not None:
+                result = self.coordination.tick(self, now)
+                if result is not None:
+                    return result
             return self._step(now)
         except (ControllerError, OSError, ValueError, KeyError, TypeError, IndexError):
             self.state['failures'] = 0
@@ -183,7 +368,8 @@ class Guard:
             if self.state['failures'] < 3 or now - self.state['failure_since'] < self.config['minimum_failure_duration']:
                 return {'event': 'node_failed', 'wait': self.config['failure_interval'], 'selected': current}
             names = [name for name in group['all'] if name != current and self._allowed(name, proxies, now)]
-            ordered = rank(names, self.state['samples'], now, self.quality, self.config.get('quality_max_age', 86400))
+            history = self.state['samples'] if self.identity_available else {}
+            ordered = rank(names, history, now, self.quality, self.config.get('quality_max_age', 86400))
             start = self.state.get('candidate_cursor', 0) % len(ordered) if ordered else 0
             ordered = ordered[start:] + ordered[:start]
             for candidate in ordered[:4]:
@@ -201,7 +387,7 @@ class Guard:
             return {'event': 'no_candidate', 'wait': self.config['failure_interval'], 'selected': current}
         self.state.update(failures=0, failure_since=None)
         primary = self.state.get('primary', current)
-        if primary != current and primary in group['all'] and self._allowed(primary, proxies, now):
+        if primary != current and self._known_identity(primary) and self._known_identity(current) and primary in group['all'] and self._allowed(primary, proxies, now):
             if self._probe(primary, now):
                 if self.state.get('recovery_since') is None:
                     self.state['recovery_since'] = now
@@ -213,17 +399,19 @@ class Guard:
         elif primary != current:
             self.state['recovery_since'] = None
         names = [name for name in group['all'] if name != current and self._allowed(name, proxies, now)]
+        if not self._known_identity(current):
+            return {'event': 'healthy', 'wait': self.config['normal_interval'], 'selected': current}
         if names and now - self.state.get('last_sample', 0) >= self.config['sampling_interval']:
             index = self.state.get('sample_index', 0) % len(names); candidate = names[index]
+            if not self._known_identity(candidate):
+                self.state['sample_index'] = index + 1
+                self.state['last_sample'] = now
+                return {'event': 'healthy', 'wait': self.config['normal_interval'], 'selected': current}
             self._probe(candidate, now)
             self.state['sample_index'] = index + 1; self.state['last_sample'] = now
-            old, new = metrics(self.state['samples'].get(current, []), now), metrics(self.state['samples'].get(candidate, []), now)
-            ready = all(m['count'] >= self.config['min_sample_count'] and m['span'] >= self.config['min_sample_span_hours'] * 3600 and m['mean_ms'] is not None for m in (old, new))
             wins = self.state['wins'].setdefault(candidate, [])
-            current_quality = quality_score(current, self.quality, now, self.config.get('quality_max_age', 86400))
-            candidate_quality = quality_score(candidate, self.quality, now, self.config.get('quality_max_age', 86400))
-            quality_ok = current_quality is None or candidate_quality is None or candidate_quality >= current_quality
-            better = ready and quality_ok and new['success_rate'] >= old['success_rate'] and new['mean_ms'] <= old['mean_ms'] * 0.8
+            self._refresh_quality()
+            better = self._candidate_better(current, candidate, now)
             if better:
                 # Count durable wins across the review window, not every rapid sample.
                 window = self.config['review_span_hours'] * 3600
@@ -234,9 +422,12 @@ class Guard:
                 self.state['wins'][candidate] = wins[-100:]
             else:
                 self.state['wins'].pop(candidate, None)
-            if (better and now - self.state['selected_since'] >= self.config['hold_days'] * 86400
-                    and len(wins) >= self.config['review_wins'] and wins[-1] - wins[0] >= self.config['review_span_hours'] * 3600
-                    and self._verified(candidate, current, now)):
-                event = self._switch(current, candidate, now, 'upgrade')
-                return {'event': event, 'wait': self.config['normal_interval'], 'selected': current, 'candidate': candidate}
+            if self._upgrade_ready(current, candidate, now):
+                baseline = self._quality_snapshot(current, candidate, self._now(now))
+                if self._verified(candidate, current, now):
+                    self._refresh_quality()
+                    if (self._quality_not_worse(baseline, self._quality_snapshot(current, candidate, self._now(now))) and
+                            self._upgrade_ready(current, candidate, self._now(now))):
+                        event = self._switch(current, candidate, now, 'upgrade', quality_baseline=baseline)
+                        return {'event': event, 'wait': self.config['normal_interval'], 'selected': current, 'candidate': candidate}
         return {'event': 'healthy', 'wait': self.config['normal_interval'], 'selected': current}
