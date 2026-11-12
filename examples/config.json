@@ -1,0 +1,22 @@
+{
+  "controller": "http://127.0.0.1:9090",
+  "secret_env": "CLASH_CONTROLLER_SECRET",
+  "group": "Example Selector",
+  "targets": [
+    {"url": "https://example.com/", "expected": "200"},
+    {"url": "https://example.org/", "expected": "200"}
+  ],
+  "health_url": "https://www.gstatic.com/generate_204",
+  "excluded_name_patterns": ["测试|測試"],
+  "normal_interval": 15,
+  "failure_interval": 5,
+  "minimum_failure_duration": 30,
+  "startup_grace": 60,
+  "sampling_interval": 120,
+  "hold_days": 30,
+  "min_sample_count": 100,
+  "min_sample_span_hours": 72,
+  "review_wins": 3,
+  "review_span_hours": 48,
+  "recovery_seconds": 1800
+}
